@@ -1,0 +1,19 @@
+pyspark==3.5.0
+pandas
+boto3           # Để kết nối S3
+psycopg2-binary # Để kết nối Postgres
+streamlit       # Để làm Web App
+beautifulsoup4  # Để cào web
+requests
+pgvector        # Thư viện hỗ trợ vector search
+jupyter 
+notebook
+scikit-learn
+selenium 
+webdriver-manager
+undetected-chromedriver
+s3fs
+scikit-learn
+pyarrow
+python-dotenv
+sqlalchemy

@@ -24,14 +24,14 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Chạy ETL: Nạp dữ liệu Silver từ S3 lên Postgres
+    - name: 🔄 Chạy ETL: Nạp dữ liệu Silver từ S3 lên Postgres
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      run: python src\load_silver_to_postgres.py
+      run: python src/load_silver_to_postgres.py
 
-    - name: Chạy AI: Huấn luyện thuật toán gợi ý
+    - name: 🧠 Chạy AI: Huấn luyện thuật toán gợi ý
       env:
         DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      run: python src\train_recommender.py
+      run: python src/train_recommender.py

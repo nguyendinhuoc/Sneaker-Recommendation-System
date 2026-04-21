@@ -1,32 +1,24 @@
-import time
-from typing import Dict
-from jose import jwt
-import os
-from dotenv import load_dotenv
+from datetime import datetime, timedelta, timezone
+import jwt
 
-load_dotenv()
+SECRET_KEY = "YOUR_SECRET_KEY"
+ALGORITHM = "HS256"
+TOKEN_EXPIRE_HOURS = 24
 
-# Các tham số cấu hình (Nên để trong file .env)
-JWT_SECRET = os.getenv("JWT_SECRET", "my_super_secret_key_123")
-JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 
-def token_response(token: str):
-    return {
-        "access_token": token
-    }
-
-def signJWT(user_id: int) -> Dict[str, str]:
-    # Tạo payload chứa ID người dùng và thời gian hết hạn (ví dụ 1 tiếng)
+def signJWT(user_id: int):
     payload = {
-        "user_id": user_id,
-        "expires": time.time() + 3600
+        "user_id": str(user_id),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=TOKEN_EXPIRE_HOURS),
     }
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return token_response(token)
+    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return {"access_token": token}
 
-def decodeJWT(token: str) -> dict:
+
+def decodeJWT(token: str):
     try:
-        decoded_token = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return decoded_token if decoded_token["expires"] >= time.time() else None
-    except:
-        return {}
+        decoded_token = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return decoded_token
+    except Exception as e:
+        print("DECODE JWT ERROR:", e)
+        return None

@@ -61,7 +61,7 @@ SEARCH_CONFIGS =[
 MAX_PAGES = 50
 STATE_FILE = "crawler_state.json"
 
-# --- 2. HÀM CHECKPOINT & S3 (Giữ nguyên) ---
+# --- 2. HÀM CHECKPOINT & S3  ---
 def save_checkpoint(category_id, page_num):
     try:
         current_state = {}
@@ -71,9 +71,9 @@ def save_checkpoint(category_id, page_num):
         current_state[category_id] = page_num
         with open(STATE_FILE, 'w') as f:
             json.dump(current_state, f)
-        print(f"   💾 Checkpoint saved: {category_id} -> Page {page_num}")
+        print(f"Checkpoint saved: {category_id} -> Page {page_num}")
     except Exception as e:
-        print(f"   ⚠️ Lỗi save checkpoint: {e}")
+        print(f"Lỗi save checkpoint: {e}")
 
 def load_checkpoint(category_id):
     if not os.path.exists(STATE_FILE): return 0

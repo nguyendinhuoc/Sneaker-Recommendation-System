@@ -17,3 +17,4 @@ scikit-learn
 pyarrow
 python-dotenv
 sqlalchemy
+PyJWT

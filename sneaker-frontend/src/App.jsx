@@ -8,7 +8,10 @@ import ProfileSection from './components/profile/ProfileSection';
 import ProductDetailPage from './components/products/ProductDetailPage';
 
 import { loginUser, registerUser } from './services/authService';
-import { fetchProductsApi, interactProductApi } from './services/productService';
+import {
+  fetchHomepageProductsApi,
+  interactProductApi,
+} from './services/productService';
 import {
   fetchCartApi,
   fetchFavoritesApi,
@@ -30,6 +33,7 @@ function AppContent() {
   const [gender, setGender] = useState('Nam');
 
   const [products, setProducts] = useState([]);
+  const [homepageType, setHomepageType] = useState('default');
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const [loadingProducts, setLoadingProducts] = useState(false);
@@ -55,7 +59,7 @@ function AppContent() {
 
   useEffect(() => {
     if (isLoggedIn && location.pathname === '/') {
-      fetchProducts(page);
+      fetchHomepageProducts(page);
     }
   }, [isLoggedIn, page, location.pathname]);
 
@@ -107,6 +111,7 @@ function AppContent() {
       localStorage.setItem('username', username);
 
       setIsLoggedIn(true);
+      setPage(1);
       await fetchProfileData();
       navigate('/');
     } catch (err) {
@@ -133,6 +138,7 @@ function AppContent() {
     setGender('Nam');
 
     setProducts([]);
+    setHomepageType('default');
     setPage(1);
     setTotalPages(1);
 
@@ -145,15 +151,16 @@ function AppContent() {
     navigate('/');
   };
 
-  const fetchProducts = async (nextPage = 1) => {
+  const fetchHomepageProducts = async (nextPage = 1) => {
     setLoadingProducts(true);
     try {
-      const data = await fetchProductsApi(nextPage, 30);
+      const data = await fetchHomepageProductsApi(nextPage, 30);
       setProducts(data.items || []);
+      setHomepageType(data.type || 'default');
       setTotalPages(data.total_pages || 1);
     } catch (err) {
-      console.error('fetchProducts error:', err);
-      alert('Không tải được danh sách sản phẩm.');
+      console.error('fetchHomepageProducts error:', err);
+      alert('Không tải được sản phẩm trang chủ.');
     } finally {
       setLoadingProducts(false);
     }
@@ -249,7 +256,10 @@ function AppContent() {
         <MainNavbar
           currentTab={currentTab}
           username={username}
-          onGoHome={() => navigate('/')}
+          onGoHome={() => {
+            setPage(1);
+            navigate('/');
+          }}
           onGoProfile={() => {
             fetchProfileData();
             navigate('/profile');
@@ -270,6 +280,7 @@ function AppContent() {
                 onPrevPage={() => setPage((prev) => Math.max(1, prev - 1))}
                 onNextPage={() => setPage((prev) => Math.min(totalPages, prev + 1))}
                 onGoPage={setPage}
+                homepageType={homepageType}
               />
             }
           />

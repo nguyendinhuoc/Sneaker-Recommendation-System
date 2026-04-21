@@ -53,6 +53,8 @@ def load_interactions(engine):
     df["interaction_type"] = df["interaction_type"].astype(str).str.strip().str.lower()
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(1).clip(lower=1)
     df["interaction_time"] = pd.to_datetime(df["interaction_time"], errors="coerce")
+    df["score"] = df["score"].round(2)
+    df["score"] = df["score"].clip(0, 100)  
     return df
 
 

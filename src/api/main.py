@@ -243,7 +243,7 @@ def get_gold_homepage(cur, user_id: str, size: int, offset: int):
             p.brand,
             p.price,
             p.image_url,
-            COALESCE(g.score, 0.0) + COALESCE(pop.popularity_score, 0.0) * 0.02 AS user_score
+            COALESCE(g.score, 0.0) AS user_score
         FROM products p
         LEFT JOIN gold_user_recommendations g
           ON g.product_id::text = p.product_id::text

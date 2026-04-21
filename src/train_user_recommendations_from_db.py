@@ -291,9 +291,10 @@ def normalize_scores(df):
         max_val = series.max()
         if pd.isna(min_val) or pd.isna(max_val) or max_val <= min_val:
             return pd.Series([0.0] * len(series), index=series.index)
-        return (series - min_val) / (max_val - min_val + 1e-9)
+        return ((series - min_val) / (max_val - min_val + 1e-9)) * 100.0
 
     df["score"] = df.groupby("user_id")["score"].transform(_normalize)
+    df["score"] = df["score"].round(2)
     return df
 
 

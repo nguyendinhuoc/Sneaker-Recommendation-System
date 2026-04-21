@@ -29,27 +29,15 @@ function getHomepageTitle(type) {
 }
 
 function getHomepageSubtitle(type) {
-  if (type === 'personalized_ranking') {
-    return 'Toàn bộ catalog vẫn được giữ nguyên, nhưng các sản phẩm gần với hành vi xem, thích, thêm giỏ hàng và mua của bạn sẽ được đẩy lên đầu giống cách các web bán giày trực tuyến hiện nay hoạt động.';
-  }
-
-  if (type === 'fallback_behavior_ranking') {
-    return 'Khi chưa có đủ dữ liệu gold ranking, hệ thống tạm thời ưu tiên những sản phẩm có thương hiệu, loại và mục đích sử dụng gần với hành vi gần đây của bạn.';
-  }
-
-  return 'Danh sách mặc định của cửa hàng. Khi bạn bắt đầu tương tác nhiều hơn, hệ thống sẽ dần cá nhân hóa thứ tự hiển thị sản phẩm.';
+  return 'Hãy tương tác nhiều hơn để cá nhân hóa theo sở thích của bạn';
 }
 
 function getHomepageBadge(type) {
-  if (type === 'personalized_ranking') {
-    return 'Personalized ranking';
-  }
 
   if (type === 'fallback_behavior_ranking') {
     return 'Behavior fallback';
   }
 
-  return 'Default catalog';
 }
 
 function formatPrice(value) {
@@ -183,12 +171,6 @@ function StoreSection({
           <p className="loading-text">Chưa có sản phẩm.</p>
         ) : (
           <>
-            <div className="store-meta-row">
-              <p className="store-result-text">
-                Đang hiển thị <b>{products.length}</b> sản phẩm trên trang này
-              </p>
-            </div>
-
             <div className="product-grid">
               {products.map((item) => (
                 <ProductCard

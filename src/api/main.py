@@ -31,9 +31,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+INTERACTION_WEIGHTS = {
+    "view": 0.5,
+    "like": 2.0,
+    "add_to_cart": 5.0,
+    "purchase": 9.0,
+}
+
 
 def get_db_conn():
-    return psycopg2.connect(os.environ.get("DATABASE_URL"))
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL is not configured")
+    return psycopg2.connect(db_url)
 
 
 def get_current_user(token: str = Depends(JWTBearer())):
@@ -46,6 +56,209 @@ def get_current_user(token: str = Depends(JWTBearer())):
         return int(payload["user_id"])
     except Exception:
         raise HTTPException(status_code=403, detail="Invalid user id in token")
+
+
+def table_exists(cur, table_name: str) -> bool:
+    cur.execute("SELECT to_regclass(%s)", (table_name,))
+    return cur.fetchone()[0] is not None
+
+
+def serialize_product_row(row):
+    return {
+        "product_id": row[0],
+        "name": row[1],
+        "brand": row[2],
+        "price": row[3],
+        "image_url": row[4],
+    }
+
+
+def serialize_ranked_product_row(row):
+    return {
+        "product_id": row[0],
+        "name": row[1],
+        "brand": row[2],
+        "price": row[3],
+        "image_url": row[4],
+        "score": float(row[5]) if row[5] is not None else 0.0,
+    }
+
+
+def fetch_total_products(cur):
+    cur.execute("SELECT COUNT(*) FROM products")
+    return cur.fetchone()[0]
+
+
+def fetch_user_interaction_count(cur, user_id: str) -> int:
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM interactions
+        WHERE user_id::text = %s
+        """,
+        (user_id,),
+    )
+    return cur.fetchone()[0]
+
+
+def fetch_gold_recommendation_count(cur, user_id: str) -> int:
+    if not table_exists(cur, "gold_user_recommendations"):
+        return 0
+
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM gold_user_recommendations
+        WHERE user_id::text = %s
+        """,
+        (user_id,),
+    )
+    return cur.fetchone()[0]
+
+
+def get_weighted_popularity_cte():
+    return """
+        WITH popularity AS (
+            SELECT
+                i.product_id::text AS product_id,
+                SUM(
+                    CASE i.interaction_type
+                        WHEN 'view' THEN 0.4
+                        WHEN 'like' THEN 1.8
+                        WHEN 'add_to_cart' THEN 4.0
+                        WHEN 'purchase' THEN 7.0
+                        ELSE 0.0
+                    END
+                    * CASE
+                        WHEN i.interaction_type IN ('add_to_cart', 'purchase')
+                            THEN LEAST(COALESCE(i.quantity, 1), 5)
+                        ELSE 1
+                      END
+                ) AS popularity_score
+            FROM interactions i
+            WHERE i.interaction_type IN ('view', 'like', 'add_to_cart', 'purchase')
+            GROUP BY i.product_id::text
+        )
+    """
+
+
+def get_recent_behavioral_homepage(cur, user_id: str, size: int, offset: int):
+    cur.execute(
+        """
+        WITH user_profile AS (
+            SELECT
+                i.user_id::text AS user_id,
+                p.brand,
+                p.category,
+                p.type,
+                p.purpose,
+                SUM(
+                    CASE i.interaction_type
+                        WHEN 'view' THEN 0.5
+                        WHEN 'like' THEN 2.0
+                        WHEN 'add_to_cart' THEN 5.0
+                        WHEN 'purchase' THEN 9.0
+                        ELSE 0.0
+                    END
+                    * CASE
+                        WHEN i.interaction_type IN ('add_to_cart', 'purchase')
+                            THEN LEAST(COALESCE(i.quantity, 1), 5)
+                        ELSE 1
+                      END
+                ) AS feature_score
+            FROM interactions i
+            JOIN products p
+              ON i.product_id::text = p.product_id::text
+            WHERE i.user_id::text = %s
+              AND i.interaction_type IN ('view', 'like', 'add_to_cart', 'purchase')
+            GROUP BY i.user_id::text, p.brand, p.category, p.type, p.purpose
+        ),
+        popularity AS (
+            SELECT
+                i.product_id::text AS product_id,
+                SUM(
+                    CASE i.interaction_type
+                        WHEN 'view' THEN 0.4
+                        WHEN 'like' THEN 1.8
+                        WHEN 'add_to_cart' THEN 4.0
+                        WHEN 'purchase' THEN 7.0
+                        ELSE 0.0
+                    END
+                    * CASE
+                        WHEN i.interaction_type IN ('add_to_cart', 'purchase')
+                            THEN LEAST(COALESCE(i.quantity, 1), 5)
+                        ELSE 1
+                      END
+                ) AS popularity_score
+            FROM interactions i
+            WHERE i.interaction_type IN ('view', 'like', 'add_to_cart', 'purchase')
+            GROUP BY i.product_id::text
+        ),
+        product_scores AS (
+            SELECT
+                p.product_id,
+                p.name,
+                p.brand,
+                p.price,
+                p.image_url,
+                COALESCE(SUM(
+                    CASE WHEN up.brand IS NOT NULL AND up.brand = p.brand THEN up.feature_score * 2.6 ELSE 0 END +
+                    CASE WHEN up.category IS NOT NULL AND up.category = p.category THEN up.feature_score * 1.4 ELSE 0 END +
+                    CASE WHEN up.type IS NOT NULL AND up.type = p.type THEN up.feature_score * 1.0 ELSE 0 END +
+                    CASE WHEN up.purpose IS NOT NULL AND up.purpose = p.purpose THEN up.feature_score * 0.8 ELSE 0 END
+                ), 0.0)
+                + COALESCE(pop.popularity_score, 0.0) * 0.03 AS user_score
+            FROM products p
+            LEFT JOIN user_profile up
+              ON (
+                  (up.brand IS NOT NULL AND up.brand = p.brand)
+                  OR (up.category IS NOT NULL AND up.category = p.category)
+                  OR (up.type IS NOT NULL AND up.type = p.type)
+                  OR (up.purpose IS NOT NULL AND up.purpose = p.purpose)
+              )
+            LEFT JOIN popularity pop
+              ON pop.product_id = p.product_id::text
+            GROUP BY p.product_id, p.name, p.brand, p.price, p.image_url, pop.popularity_score
+        )
+        SELECT product_id, name, brand, price, image_url, user_score
+        FROM product_scores
+        ORDER BY
+            CASE WHEN user_score > 0 THEN 0 ELSE 1 END ASC,
+            user_score DESC,
+            product_id::int DESC
+        LIMIT %s OFFSET %s
+        """,
+        (user_id, size, offset),
+    )
+    return cur.fetchall()
+
+
+def get_gold_homepage(cur, user_id: str, size: int, offset: int):
+    cur.execute(
+        f"""
+        {get_weighted_popularity_cte()}
+        SELECT
+            p.product_id,
+            p.name,
+            p.brand,
+            p.price,
+            p.image_url,
+            COALESCE(g.score, 0.0) + COALESCE(pop.popularity_score, 0.0) * 0.02 AS user_score
+        FROM products p
+        LEFT JOIN gold_user_recommendations g
+          ON g.product_id::text = p.product_id::text
+         AND g.user_id::text = %s
+        LEFT JOIN popularity pop
+          ON pop.product_id = p.product_id::text
+        ORDER BY
+            CASE WHEN g.score IS NOT NULL THEN 0 ELSE 1 END ASC,
+            user_score DESC,
+            p.product_id::int DESC
+        LIMIT %s OFFSET %s
+        """,
+        (user_id, size, offset),
+    )
+    return cur.fetchall()
 
 
 @app.get("/")
@@ -183,7 +396,7 @@ def interact(
             INSERT INTO interactions (user_id, product_id, interaction_type, quantity, interaction_time)
             VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
             """,
-            (current_user_id, req.product_id, action_type, quantity),
+            (current_user_id, str(req.product_id), action_type, quantity),
         )
 
         conn.commit()
@@ -201,14 +414,123 @@ def interact(
         conn.close()
 
 
-def _serialize_rec_item(item):
-    return {
-        "product_id": item["product_id"],
-        "name": item["name"],
-        "price": item["price"],
-        "image_url": item["image_url"],
-        "brand": item.get("brand"),
-    }
+@app.get("/products")
+def get_products(page: int = 1, size: int = 30):
+    page = max(1, page)
+    size = min(max(1, size), 60)
+    offset = (page - 1) * size
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT product_id, name, brand, price, image_url
+            FROM products
+            ORDER BY product_id::int DESC
+            LIMIT %s OFFSET %s
+            """,
+            (size, offset),
+        )
+        rows = cur.fetchall()
+        total = fetch_total_products(cur)
+
+        return {
+            "type": "default",
+            "items": [serialize_product_row(r) for r in rows],
+            "total_pages": (total + size - 1) // size,
+        }
+
+    except Exception as e:
+        print(f"Lỗi lấy sản phẩm: {e}")
+        return {"type": "default", "items": [], "total_pages": 0}
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/products/homepage")
+def get_homepage_products(
+    page: int = 1,
+    size: int = 30,
+    current_user_id: int = Depends(get_current_user),
+):
+    page = max(1, page)
+    size = min(max(1, size), 60)
+    user_id = str(current_user_id)
+    offset = (page - 1) * size
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        gold_count = fetch_gold_recommendation_count(cur, user_id)
+
+        if gold_count > 0:
+            rows = get_gold_homepage(cur, user_id, size, offset)
+            total = fetch_total_products(cur)
+            return {
+                "type": "personalized_ranking",
+                "items": [serialize_ranked_product_row(r) for r in rows],
+                "total_pages": (total + size - 1) // size,
+            }
+
+        interaction_count = fetch_user_interaction_count(cur, user_id)
+
+        if interaction_count > 0:
+            rows = get_recent_behavioral_homepage(cur, user_id, size, offset)
+            total = fetch_total_products(cur)
+            return {
+                "type": "fallback_behavior_ranking",
+                "items": [serialize_ranked_product_row(r) for r in rows],
+                "total_pages": (total + size - 1) // size,
+            }
+
+        cur.execute(
+            """
+            SELECT product_id, name, brand, price, image_url
+            FROM products
+            ORDER BY product_id::int DESC
+            LIMIT %s OFFSET %s
+            """,
+            (size, offset),
+        )
+        rows = cur.fetchall()
+        total = fetch_total_products(cur)
+
+        return {
+            "type": "default",
+            "items": [serialize_product_row(r) for r in rows],
+            "total_pages": (total + size - 1) // size,
+        }
+
+    except Exception as e:
+        print(f"Lỗi homepage personalized ranking: {e}")
+        return {"type": "default", "items": [], "total_pages": 0}
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/products/detail/{p_id}")
+def get_product_detail(p_id: str):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM products WHERE product_id::text = %s", (str(p_id),))
+        row = cur.fetchone()
+
+        if row:
+            col_names = [desc[0] for desc in cur.description]
+            return dict(zip(col_names, row))
+        return {}
+
+    except Exception as e:
+        print(f"Lỗi lấy chi tiết sản phẩm: {e}")
+        return {}
+    finally:
+        cur.close()
+        conn.close()
 
 
 @app.get("/recommendations/{p_id}")
@@ -216,35 +538,17 @@ def get_item_recommendations(p_id: str, randomize: bool = False):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
-        cur.execute(
-            """
-            SELECT product_id, brand, category, style, type, purpose, color, material
-            FROM products
-            WHERE product_id::text = %s
-            """,
-            (p_id,),
-        )
-        base_product = cur.fetchone()
-
-        if not base_product:
+        if not table_exists(cur, "gold_item_similarity"):
             return []
-
-        _, base_brand, base_category, base_style, base_type, base_purpose, base_color, base_material = base_product
 
         cur.execute(
             """
             SELECT
                 p.product_id,
                 p.name,
+                p.brand,
                 p.price,
                 p.image_url,
-                p.brand,
-                p.category,
-                p.style,
-                p.type,
-                p.purpose,
-                p.color,
-                p.material,
                 g.rank,
                 g.similarity_score
             FROM gold_item_similarity g
@@ -252,146 +556,34 @@ def get_item_recommendations(p_id: str, randomize: bool = False):
               ON g.similar_product_id::text = p.product_id::text
             WHERE g.product_id::text = %s
             ORDER BY g.rank ASC
-            LIMIT 30
+            LIMIT 20
             """,
-            (p_id,),
+            (str(p_id),),
         )
         rows = cur.fetchall()
 
-        ranked_items = []
+        items = [
+            {
+                "product_id": r[0],
+                "name": r[1],
+                "brand": r[2],
+                "price": r[3],
+                "image_url": r[4],
+                "rank": int(r[5]),
+                "similarity_score": float(r[6]),
+            }
+            for r in rows
+            if str(r[0]) != str(p_id)
+        ]
 
-        for r in rows:
-            product_id, name, price, image_url, brand, category, style, type_, purpose, color, material, rank, similarity_score = r
-
-            if str(product_id) == str(p_id):
-                continue
-
-            same_category = category and base_category and category == base_category
-            same_type = type_ and base_type and type_ == base_type
-            same_purpose = purpose and base_purpose and purpose == base_purpose
-            same_style = style and base_style and style == base_style
-
-            if not ((same_category and same_type) or same_purpose or same_style):
-                continue
-
-            candidate_name_text = (name or "").lower()
-
-            if base_category and str(base_category).lower() == "men" and "women" in candidate_name_text:
-                continue
-
-            meta_bonus = 0
-
-            if brand and base_brand and brand == base_brand:
-                meta_bonus += 0.25
-            if category and base_category and category == base_category:
-                meta_bonus += 0.20
-            if type_ and base_type and type_ == base_type:
-                meta_bonus += 0.20
-            if purpose and base_purpose and purpose == base_purpose:
-                meta_bonus += 0.20
-            if style and base_style and style == base_style:
-                meta_bonus += 0.10
-            if material and base_material and material == base_material:
-                meta_bonus += 0.03
-            if color and base_color and color == base_color:
-                meta_bonus += 0.02
-
-            final_score = float(similarity_score) + meta_bonus
-
-            ranked_items.append(
-                {
-                    "product_id": product_id,
-                    "name": name,
-                    "price": price,
-                    "image_url": image_url,
-                    "brand": brand,
-                    "final_score": final_score,
-                }
-            )
-
-        ranked_items.sort(key=lambda x: x["final_score"], reverse=True)
-
-        candidate_pool = ranked_items[:16] if len(ranked_items) > 16 else ranked_items
+        candidate_pool = items[:16] if len(items) > 16 else items
 
         if randomize and len(candidate_pool) > 5:
-            selected_items = random.sample(candidate_pool, 5)
-            selected_items.sort(key=lambda x: x["final_score"], reverse=True)
-        else:
-            selected_items = candidate_pool[:5]
+            picked = random.sample(candidate_pool, 5)
+            picked.sort(key=lambda x: x.get("similarity_score", 0), reverse=True)
+            return picked
 
-        result = [_serialize_rec_item(item) for item in selected_items]
-
-        existing_ids = [str(item["product_id"]) for item in result]
-        existing_ids.append(str(p_id))
-
-        if len(result) < 5:
-            limit_needed = 5 - len(result)
-
-            cur.execute(
-                """
-                SELECT
-                    product_id,
-                    name,
-                    price,
-                    image_url,
-                    brand,
-                    (
-                        CASE WHEN brand = %s THEN 4 ELSE 0 END +
-                        CASE WHEN category = %s THEN 3 ELSE 0 END +
-                        CASE WHEN type = %s THEN 3 ELSE 0 END +
-                        CASE WHEN purpose = %s THEN 2 ELSE 0 END +
-                        CASE WHEN style = %s THEN 2 ELSE 0 END +
-                        CASE WHEN material = %s THEN 1 ELSE 0 END +
-                        CASE WHEN color = %s THEN 1 ELSE 0 END
-                    ) AS fallback_score
-                FROM products
-                WHERE product_id::text != ALL(%s)
-                  AND (
-                    brand = %s
-                    OR category = %s
-                    OR type = %s
-                    OR purpose = %s
-                    OR style = %s
-                    OR material = %s
-                    OR color = %s
-                  )
-                ORDER BY fallback_score DESC, product_id::int DESC
-                LIMIT %s
-                """,
-                (
-                    base_brand,
-                    base_category,
-                    base_type,
-                    base_purpose,
-                    base_style,
-                    base_material,
-                    base_color,
-                    existing_ids,
-                    base_brand,
-                    base_category,
-                    base_type,
-                    base_purpose,
-                    base_style,
-                    base_material,
-                    base_color,
-                    limit_needed,
-                ),
-            )
-
-            fallback_rows = cur.fetchall()
-
-            for r in fallback_rows:
-                result.append(
-                    {
-                        "product_id": r[0],
-                        "name": r[1],
-                        "price": r[2],
-                        "image_url": r[3],
-                        "brand": r[4],
-                    }
-                )
-
-        return result[:5]
+        return candidate_pool[:5]
 
     except Exception as e:
         print(f"Lỗi gọi gợi ý item: {e}")
@@ -412,260 +604,57 @@ def get_personalized_item_recommendations(
     cur = conn.cursor()
 
     try:
-        cur.execute(
-            """
-            SELECT product_id, brand, category, style, type, purpose, color, material
-            FROM products
-            WHERE product_id::text = %s
-            """,
-            (p_id,),
-        )
-        base_product = cur.fetchone()
-
-        if not base_product:
+        if not table_exists(cur, "gold_user_recommendations"):
             return []
-
-        _, base_brand, base_category, base_style, base_type, base_purpose, base_color, base_material = base_product
-
-        cur.execute(
-            """
-            SELECT COUNT(*)
-            FROM interactions
-            WHERE user_id = %s
-            """,
-            (user_id,),
-        )
-        interaction_count = cur.fetchone()[0]
-
-        if interaction_count < 3:
-            cur.execute(
-                """
-                SELECT
-                    p.product_id,
-                    p.name,
-                    p.price,
-                    p.image_url,
-                    p.brand
-                FROM gold_item_similarity g
-                JOIN products p
-                  ON g.similar_product_id::text = p.product_id::text
-                WHERE g.product_id::text = %s
-                ORDER BY g.rank ASC
-                LIMIT 20
-                """,
-                (p_id,),
-            )
-            rows = cur.fetchall()
-
-            fallback_items = [
-                {
-                    "product_id": r[0],
-                    "name": r[1],
-                    "price": r[2],
-                    "image_url": r[3],
-                    "brand": r[4],
-                }
-                for r in rows
-                if str(r[0]) != str(p_id)
-            ]
-
-            candidate_pool = fallback_items[:16] if len(fallback_items) > 16 else fallback_items
-
-            if randomize and len(candidate_pool) > 5:
-                return random.sample(candidate_pool, 5)
-
-            return candidate_pool[:5]
-
-        cur.execute(
-            """
-            SELECT
-                p.brand,
-                p.category,
-                p.type,
-                p.purpose,
-                i.interaction_type,
-                COUNT(*) as cnt
-            FROM interactions i
-            JOIN products p
-              ON i.product_id::text = p.product_id::text
-            WHERE i.user_id = %s
-              AND i.interaction_type IN ('view', 'like', 'add_to_cart', 'purchase')
-            GROUP BY p.brand, p.category, p.type, p.purpose, i.interaction_type
-            """,
-            (user_id,),
-        )
-        profile_rows = cur.fetchall()
-
-        interaction_weights = {
-            "view": 1,
-            "like": 3,
-            "add_to_cart": 5,
-            "purchase": 8,
-        }
-
-        brand_scores = {}
-        category_scores = {}
-        type_scores = {}
-        purpose_scores = {}
-
-        for brand, category, type_, purpose, interaction_type, cnt in profile_rows:
-            score = interaction_weights.get(interaction_type, 0) * cnt
-            if brand:
-                brand_scores[brand] = brand_scores.get(brand, 0) + score
-            if category:
-                category_scores[category] = category_scores.get(category, 0) + score
-            if type_:
-                type_scores[type_] = type_scores.get(type_, 0) + score
-            if purpose:
-                purpose_scores[purpose] = purpose_scores.get(purpose, 0) + score
 
         cur.execute(
             """
             SELECT
                 p.product_id,
                 p.name,
+                p.brand,
                 p.price,
                 p.image_url,
-                p.brand,
-                p.category,
-                p.style,
-                p.type,
-                p.purpose,
-                p.color,
-                p.material,
-                g.rank,
-                g.similarity_score
-            FROM gold_item_similarity g
+                g.score
+            FROM gold_user_recommendations g
             JOIN products p
-              ON g.similar_product_id::text = p.product_id::text
-            WHERE g.product_id::text = %s
-            ORDER BY g.rank ASC
+              ON g.product_id::text = p.product_id::text
+            WHERE g.user_id::text = %s
+              AND g.product_id::text != %s
+            ORDER BY g.score DESC
             LIMIT 30
             """,
-            (p_id,),
+            (user_id, str(p_id)),
         )
         rows = cur.fetchall()
 
-        ranked_items = []
-
-        for r in rows:
-            product_id, name, price, image_url, brand, category, style, type_, purpose, color, material, rank, similarity_score = r
-
-            if str(product_id) == str(p_id):
-                continue
-
-            meta_bonus = 0
-            if brand and base_brand and brand == base_brand:
-                meta_bonus += 0.25
-            if category and base_category and category == base_category:
-                meta_bonus += 0.20
-            if type_ and base_type and type_ == base_type:
-                meta_bonus += 0.20
-            if purpose and base_purpose and purpose == base_purpose:
-                meta_bonus += 0.20
-            if style and base_style and style == base_style:
-                meta_bonus += 0.10
-            if material and base_material and material == base_material:
-                meta_bonus += 0.03
-            if color and base_color and color == base_color:
-                meta_bonus += 0.02
-
-            user_bonus = 0
-            user_bonus += brand_scores.get(brand, 0) * 0.08
-            user_bonus += category_scores.get(category, 0) * 0.05
-            user_bonus += type_scores.get(type_, 0) * 0.04
-            user_bonus += purpose_scores.get(purpose, 0) * 0.03
-
-            final_score = float(similarity_score) + meta_bonus + user_bonus
-
-            ranked_items.append(
-                {
-                    "product_id": product_id,
-                    "name": name,
-                    "price": price,
-                    "image_url": image_url,
-                    "brand": brand,
-                    "final_score": final_score,
-                }
-            )
-
-        ranked_items.sort(key=lambda x: x["final_score"], reverse=True)
-
-        candidate_pool = ranked_items[:16] if len(ranked_items) > 16 else ranked_items
-
-        if randomize and len(candidate_pool) > 5:
-            selected_items = random.sample(candidate_pool, 5)
-            selected_items.sort(key=lambda x: x["final_score"], reverse=True)
-        else:
-            selected_items = candidate_pool[:5]
-
-        return selected_items
-
-    except Exception as e:
-        print(f"Lỗi personalized detail rec: {e}")
-        return []
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.get("/products")
-def get_products(page: int = 1, size: int = 30):
-    offset = (page - 1) * size
-    conn = get_db_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            SELECT product_id, name, brand, price, image_url
-            FROM products
-            ORDER BY product_id::int
-            LIMIT %s OFFSET %s
-            """,
-            (size, offset),
-        )
-        rows = cur.fetchall()
-
-        products = [
+        items = [
             {
                 "product_id": r[0],
                 "name": r[1],
                 "brand": r[2],
                 "price": r[3],
                 "image_url": r[4],
+                "score": float(r[5]),
             }
             for r in rows
         ]
 
-        cur.execute("SELECT COUNT(*) FROM products")
-        total = cur.fetchone()[0]
+        if not items:
+            return []
 
-        return {"items": products, "total_pages": (total + size - 1) // size}
+        candidate_pool = items[:16] if len(items) > 16 else items
 
-    except Exception as e:
-        print(f"Lỗi lấy sản phẩm: {e}")
-        return {"items": [], "total_pages": 0}
-    finally:
-        cur.close()
-        conn.close()
+        if randomize and len(candidate_pool) > 5:
+            picked = random.sample(candidate_pool, 5)
+            picked.sort(key=lambda x: x.get("score", 0), reverse=True)
+            return picked
 
-
-@app.get("/products/detail/{p_id}")
-def get_product_detail(p_id: str):
-    conn = get_db_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT * FROM products WHERE product_id::text = %s", (p_id,))
-        row = cur.fetchone()
-
-        if row:
-            col_names = [desc[0] for desc in cur.description]
-            return dict(zip(col_names, row))
-        return {}
+        return candidate_pool[:5]
 
     except Exception as e:
-        print(f"Lỗi lấy chi tiết sản phẩm: {e}")
-        return {}
+        print(f"Lỗi personalized detail rec: {e}")
+        return []
     finally:
         cur.close()
         conn.close()

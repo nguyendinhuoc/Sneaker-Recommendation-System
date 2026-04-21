@@ -1,36 +1,90 @@
-name: Sneaker AI Pipeline
+name: Sneaker Recommendation Production Training
 
 on:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: "0 2 * * *"
   workflow_dispatch:
 
+concurrency:
+  group: sneaker-recommendation-production-training
+  cancel-in-progress: false
+
 jobs:
-  run-pipeline:
+  train-production-models:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Load Silver data to Neon
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python src/scripts/load_silver_to_postgres.py
+      - name: Validate production environment
+        run: |
+          python - <<'PY'
+          import os
+          required = ["DATABASE_URL"]
+          missing = [key for key in required if not os.getenv(key)]
+          if missing:
+              raise SystemExit(f"Missing required secrets: {', '.join(missing)}")
+          print("Environment validation passed.")
+          PY
 
-      - name: Train hybrid item similarity from Neon interactions
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      - name: Print source table health
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(os.environ["DATABASE_URL"])
+
+          queries = {
+              "products": "SELECT COUNT(*) FROM products",
+              "users": "SELECT COUNT(*) FROM users",
+              "interactions": "SELECT COUNT(*) FROM interactions",
+          }
+
+          with engine.begin() as conn:
+              for name, sql in queries.items():
+                  count = conn.execute(text(sql)).scalar()
+                  print(f"{name}_count={count}")
+          PY
+
+      - name: Train gold_item_similarity from live Neon interactions
         run: python src/train_item_similarity_from_db.py
+
+      - name: Train gold_user_recommendations from live Neon interactions
+        run: python src/train_user_recommendations_from_db.py
+
+      - name: Print gold table health
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(os.environ["DATABASE_URL"])
+
+          queries = {
+              "gold_item_similarity": "SELECT COUNT(*) FROM gold_item_similarity",
+              "gold_user_recommendations": "SELECT COUNT(*) FROM gold_user_recommendations",
+          }
+
+          with engine.begin() as conn:
+              for name, sql in queries.items():
+                  count = conn.execute(text(sql)).scalar()
+                  print(f"{name}_count={count}")
+          PY

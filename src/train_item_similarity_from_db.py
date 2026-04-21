@@ -1,25 +1,38 @@
-import pandas as pd
-import numpy as np
-from sqlalchemy import create_engine
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.feature_extraction.text import TfidfVectorizer
 import os
+import pandas as pd
 from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 load_dotenv()
 
+BASE_SCORES = {
+    "view": 0.5,
+    "like": 2.0,
+    "add_to_cart": 5.0,
+    "purchase": 9.0,
+}
 
-def train_item_based_model():
-    print("--- KHỞI ĐỘNG VÒNG LẶP AI ---")
+EVENT_CAPS = {
+    "view": 2.0,
+    "like": 4.0,
+    "add_to_cart": 8.0,
+    "purchase": 12.0,
+}
 
-    # 1. Kết nối Database
+TOP_K = 24
+MIN_SIMILARITY = 0.06
+
+
+def build_engine():
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
-        raise ValueError("DATABASE_URL không tồn tại trong file .env")
-    engine = create_engine(db_url)
+        raise ValueError("DATABASE_URL không tồn tại trong môi trường")
+    return create_engine(db_url)
 
-    # 2. Lấy dữ liệu interactions
-    print("1. Đang lấy dữ liệu hành vi người dùng...")
+
+def load_interactions(engine):
     query = """
         SELECT
             user_id,
@@ -31,9 +44,18 @@ def train_item_based_model():
         WHERE interaction_type IN ('view', 'like', 'add_to_cart', 'purchase')
     """
     df = pd.read_sql(query, engine)
+    if df.empty:
+        return df
 
-    # 2b. Lấy metadata sản phẩm
-    print("1b. Đang lấy metadata sản phẩm...")
+    df["user_id"] = df["user_id"].astype(str)
+    df["product_id"] = df["product_id"].astype(str)
+    df["interaction_type"] = df["interaction_type"].astype(str).str.strip().str.lower()
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(1).clip(lower=1)
+    df["interaction_time"] = pd.to_datetime(df["interaction_time"], errors="coerce")
+    return df
+
+
+def load_products(engine):
     product_query = """
         SELECT
             product_id,
@@ -48,30 +70,9 @@ def train_item_based_model():
         FROM products
     """
     product_df = pd.read_sql(product_query, engine)
-
-    if df.empty:
-        print("Chưa có tương tác nào. Hãy lên Web click xem và mua vài đôi giày trước nhé!")
-        return
-
     if product_df.empty:
-        print("Không có dữ liệu products để tính content similarity.")
-        return
+        return product_df
 
-    # 3. Chuẩn hóa dữ liệu interactions
-    df["user_id"] = df["user_id"].astype(str)
-    df["product_id"] = df["product_id"].astype(str)
-    df["interaction_type"] = df["interaction_type"].astype(str).str.strip().str.lower()
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(1).clip(lower=1)
-    df["interaction_time"] = pd.to_datetime(df["interaction_time"], errors="coerce")
-
-    print("Tổng số interactions dùng để train:", len(df))
-    print("Phân bố interaction type:")
-    print(df["interaction_type"].value_counts())
-    print("Số user:", df["user_id"].nunique())
-    print("Số product trong interactions:", df["product_id"].nunique())
-    print("Tổng số product trong catalog:", product_df["product_id"].nunique())
-
-    # 4. Chuẩn hóa metadata sản phẩm
     product_df["product_id"] = product_df["product_id"].astype(str)
 
     metadata_cols = ["name", "brand", "category", "style", "type", "purpose", "color", "material"]
@@ -79,164 +80,193 @@ def train_item_based_model():
         product_df[col] = product_df[col].fillna("").astype(str).str.strip().str.lower()
 
     product_df["content_text"] = (
-        product_df["name"] + " " +
-        product_df["brand"] + " " +
-        product_df["category"] + " " +
-        product_df["style"] + " " +
-        product_df["type"] + " " +
-        product_df["purpose"] + " " +
-        product_df["color"] + " " +
-        product_df["material"]
+        product_df["name"] + " "
+        + product_df["brand"] + " "
+        + product_df["category"] + " "
+        + product_df["style"] + " "
+        + product_df["type"] + " "
+        + product_df["purpose"] + " "
+        + product_df["color"] + " "
+        + product_df["material"]
     ).str.strip()
 
-    # 5. Chấm điểm interactions
-    print("2. Đang chấm điểm interaction với time decay + quantity cap...")
+    return product_df
 
-    base_scores = {
-        "view": 0.5,
-        "like": 2.0,
-        "add_to_cart": 5.0,
-        "purchase": 9.0,
-    }
 
-    df["base_score"] = df["interaction_type"].map(base_scores).fillna(0.0)
-    df = df[df["base_score"] > 0].copy()
+def score_interactions(df):
+    if df.empty:
+        return pd.DataFrame(columns=["user_id", "product_id", "score"])
 
-    # quantity chỉ nên tăng điểm ở event mạnh
-    df["quantity_factor"] = 1.0
-    strong_mask = df["interaction_type"].isin(["add_to_cart", "purchase"])
-    df.loc[strong_mask, "quantity_factor"] = 1 + 0.15 * (
-        df.loc[strong_mask, "quantity"].clip(upper=5) - 1
+    scored = df.copy()
+    scored["base_score"] = scored["interaction_type"].map(BASE_SCORES).fillna(0.0)
+    scored = scored[scored["base_score"] > 0].copy()
+
+    strong_mask = scored["interaction_type"].isin(["add_to_cart", "purchase"])
+    scored["quantity_factor"] = 1.0
+    scored.loc[strong_mask, "quantity_factor"] = 1 + 0.15 * (
+        scored.loc[strong_mask, "quantity"].clip(upper=5) - 1
     )
 
-    # time decay
-    latest_time = df["interaction_time"].max()
+    latest_time = scored["interaction_time"].max()
     if pd.notna(latest_time):
-        days_diff = (latest_time - df["interaction_time"]).dt.days.fillna(0).clip(lower=0)
-        df["time_decay"] = 0.5 ** (days_diff / 30.0)
+        days_diff = (latest_time - scored["interaction_time"]).dt.days.fillna(0).clip(lower=0)
+        scored["time_decay"] = 0.5 ** (days_diff / 30.0)
     else:
-        df["time_decay"] = 1.0
+        scored["time_decay"] = 1.0
 
-    df["score"] = df["base_score"] * df["quantity_factor"] * df["time_decay"]
+    scored["score"] = scored["base_score"] * scored["quantity_factor"] * scored["time_decay"]
 
-    # cap theo loại event để tránh spam
-    event_caps = {
-        "view": 2.0,
-        "like": 4.0,
-        "add_to_cart": 8.0,
-        "purchase": 12.0,
-    }
-
-    df_grouped = (
-        df.groupby(["user_id", "product_id", "interaction_type"], as_index=False)["score"]
+    grouped = (
+        scored.groupby(["user_id", "product_id", "interaction_type"], as_index=False)["score"]
         .sum()
     )
 
-    df_grouped["score"] = df_grouped.apply(
-        lambda row: min(row["score"], event_caps.get(row["interaction_type"], row["score"])),
-        axis=1
+    grouped["score"] = grouped.apply(
+        lambda row: min(row["score"], EVENT_CAPS.get(row["interaction_type"], row["score"])),
+        axis=1,
     )
 
-    df_grouped = (
-        df_grouped.groupby(["user_id", "product_id"], as_index=False)["score"]
-        .sum()
-    )
+    grouped = grouped.groupby(["user_id", "product_id"], as_index=False)["score"].sum()
+    return grouped
 
-    # 6. Tạo user-item matrix
-    print("3. Đang xây dựng ma trận user-item...")
-    user_item_matrix = df_grouped.pivot(
+
+def compute_behavior_similarity(scored_df):
+    if scored_df.empty:
+        return pd.DataFrame()
+
+    user_item_matrix = scored_df.pivot(
         index="user_id",
         columns="product_id",
-        values="score"
+        values="score",
     ).fillna(0)
 
-    print(f"Kích thước user-item matrix: {user_item_matrix.shape}")
-
-    # 7. Behavior similarity
-    print("4. Đang tính behavior similarity từ interactions...")
     item_user_matrix = user_item_matrix.T
-    behavior_similarity_matrix = cosine_similarity(item_user_matrix)
+    similarity_matrix = cosine_similarity(item_user_matrix)
 
-    behavior_sim_df = pd.DataFrame(
-        behavior_similarity_matrix,
+    return pd.DataFrame(
+        similarity_matrix,
         index=item_user_matrix.index.astype(str),
-        columns=item_user_matrix.index.astype(str)
+        columns=item_user_matrix.index.astype(str),
     )
 
-    # 8. Content similarity
-    print("4b. Đang tính content similarity từ metadata...")
-    tfidf = TfidfVectorizer()
+
+def compute_content_similarity(product_df):
+    if product_df.empty:
+        return pd.DataFrame()
+
+    tfidf = TfidfVectorizer(
+        ngram_range=(1, 2),
+        min_df=1,
+        max_df=0.95,
+    )
     content_vectors = tfidf.fit_transform(product_df["content_text"])
 
-    content_similarity_matrix = cosine_similarity(content_vectors)
+    similarity_matrix = cosine_similarity(content_vectors)
 
-    content_sim_df = pd.DataFrame(
-        content_similarity_matrix,
+    return pd.DataFrame(
+        similarity_matrix,
         index=product_df["product_id"].astype(str),
-        columns=product_df["product_id"].astype(str)
+        columns=product_df["product_id"].astype(str),
     )
 
-    # 9. Gộp hybrid similarity
-    print("4c. Đang gộp behavior + content similarity...")
 
+def merge_hybrid_similarity(behavior_sim_df, content_sim_df):
     all_product_ids = sorted(
         set(behavior_sim_df.index.astype(str)).union(set(content_sim_df.index.astype(str)))
     )
 
+    if not all_product_ids:
+        return pd.DataFrame()
+
     behavior_sim_df = behavior_sim_df.reindex(
         index=all_product_ids,
         columns=all_product_ids,
-        fill_value=0.0
+        fill_value=0.0,
     )
-
     content_sim_df = content_sim_df.reindex(
         index=all_product_ids,
         columns=all_product_ids,
-        fill_value=0.0
+        fill_value=0.0,
     )
 
-    # Trọng số hybrid
-    hybrid_sim_df = 0.7 * behavior_sim_df + 0.3 * content_sim_df
+    return 0.72 * behavior_sim_df + 0.28 * content_sim_df
 
-    # 10. Lấy top similar items cho mỗi product
-    print("5. Đang chọn lọc Top gợi ý tốt nhất...")
 
+def build_item_recommendations(hybrid_sim_df):
     recommendations = []
 
-    MIN_SIMILARITY = 0.08
-    TOP_K = 16
+    if hybrid_sim_df.empty:
+        return pd.DataFrame(columns=["product_id", "similar_product_id", "rank", "similarity_score"])
 
     for product_id in hybrid_sim_df.index:
         similar_scores = hybrid_sim_df[product_id].sort_values(ascending=False)
         similar_scores = similar_scores[similar_scores.index != product_id]
-        similar_scores = similar_scores[similar_scores >= MIN_SIMILARITY]
+        similar_scores = similar_scores[similar_scores >= MIN_SIMILARITY].head(TOP_K)
 
-        top_k = similar_scores.head(TOP_K)
+        for rank, (sim_id, sim_score) in enumerate(similar_scores.items(), start=1):
+            recommendations.append(
+                {
+                    "product_id": str(product_id),
+                    "similar_product_id": str(sim_id),
+                    "rank": rank,
+                    "similarity_score": round(float(sim_score), 6),
+                }
+            )
 
-        rank = 1
-        for sim_id, sim_score in top_k.items():
-            recommendations.append({
-                "product_id": str(product_id),
-                "similar_product_id": str(sim_id),
-                "rank": rank,
-                "similarity_score": round(float(sim_score), 4),
-            })
-            rank += 1
+    return pd.DataFrame(recommendations)
 
-    # 11. Lưu xuống gold_item_similarity
-    if recommendations:
-        print("6. Đang lưu bộ não mới lên tầng Gold...")
-        final_df = pd.DataFrame(recommendations)
 
-        final_df["product_id"] = final_df["product_id"].astype(str)
-        final_df["similar_product_id"] = final_df["similar_product_id"].astype(str)
+def atomic_replace_table(engine, df, target_table: str):
+    staging_table = f"{target_table}_staging"
 
-        final_df.to_sql("gold_item_similarity", engine, if_exists="replace", index=False)
+    with engine.begin() as conn:
+        conn.execute(text(f'DROP TABLE IF EXISTS "{staging_table}"'))
+        df.to_sql(staging_table, conn, if_exists="replace", index=False)
+        conn.execute(text(f'DROP TABLE IF EXISTS "{target_table}"'))
+        conn.execute(text(f'ALTER TABLE "{staging_table}" RENAME TO "{target_table}"'))
 
-        print(f"HOÀN TẤT! Đã tạo ra {len(final_df)} cặp gợi ý hybrid.")
-        print(f"Số sản phẩm có item-similarity: {final_df['product_id'].nunique()}")
-    else:
-        print("Dữ liệu chưa đủ để tạo ra item similarity.")
+
+def train_item_based_model():
+    print("--- TRAIN GOLD ITEM SIMILARITY ---")
+    engine = build_engine()
+
+    print("1. Đang đọc interactions thật từ Neon...")
+    interactions_df = load_interactions(engine)
+
+    print("2. Đang đọc catalog sản phẩm...")
+    product_df = load_products(engine)
+
+    if product_df.empty:
+        print("Không có products trong catalog.")
+        return
+
+    print("3. Đang chấm điểm hành vi...")
+    scored_df = score_interactions(interactions_df)
+
+    if scored_df.empty:
+        print("Không có đủ interactions thật, fallback sang content-only similarity.")
+
+    print("4. Đang tính behavior similarity...")
+    behavior_sim_df = compute_behavior_similarity(scored_df)
+
+    print("5. Đang tính content similarity...")
+    content_sim_df = compute_content_similarity(product_df)
+
+    print("6. Đang gộp thành hybrid similarity...")
+    hybrid_sim_df = merge_hybrid_similarity(behavior_sim_df, content_sim_df)
+
+    print("7. Đang tạo top similar items...")
+    final_df = build_item_recommendations(hybrid_sim_df)
+
+    if final_df.empty:
+        print("Dữ liệu chưa đủ để tạo gold_item_similarity.")
+        return
+
+    print("8. Đang atomic swap bảng gold_item_similarity...")
+    atomic_replace_table(engine, final_df, "gold_item_similarity")
+
+    print(f"Hoàn tất: {len(final_df)} dòng")
+    print(f"Số sản phẩm có similarity: {final_df['product_id'].nunique()}")
 
 
 if __name__ == "__main__":

@@ -297,6 +297,7 @@ def normalize_scores(df):
 
     df["score"] = df.groupby("user_id")["score"].transform(_normalize)
     df["score"] = df["score"].round(2)
+    df["score"] = df["score"].clip(0, 100)
     return df
 
 
